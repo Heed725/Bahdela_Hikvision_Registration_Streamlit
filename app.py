@@ -10,6 +10,7 @@ from html import escape
 import streamlit as st
 
 from hikvision import HikvisionClient, HikvisionError, response_message
+from sites import Site, load_sites
 
 
 st.set_page_config(
@@ -58,13 +59,6 @@ st.markdown(
 )
 
 
-def setting(name: str, default: str = "") -> str:
-    try:
-        return str(st.secrets.get(name, os.getenv(name, default)))
-    except Exception:
-        return os.getenv(name, default)
-
-
 def safe_equal(left: str, right: str) -> bool:
     if not left or not right:
         return False
@@ -73,53 +67,74 @@ def safe_equal(left: str, right: str) -> bool:
     return hmac.compare_digest(left_digest, right_digest)
 
 
-def api_client() -> HikvisionClient:
-    return HikvisionClient(
-        setting("HIKVISION_URL"),
-        setting("HIKVISION_USERNAME", "admin"),
-        setting("HIKVISION_PASSWORD"),
-        int(setting("HIKVISION_TIMEOUT", "45")),
-        setting("HIKVISION_VERIFY_TLS", "false").lower() == "true",
-    )
+def api_client(site: Site) -> HikvisionClient:
+    return HikvisionClient(site.url, site.username, site.password, site.timeout, site.verify_tls)
 
 
 def reset_registration() -> None:
-    for key in ("employee", "verified_at", "face_done", "fingerprint_done"):
-        st.session_state.pop(key, None)
+    for key in list(st.session_state):
+        if key in {"employee", "verified_at", "face_done", "fingerprint_done", "registration_site"} or key.startswith("reg_"):
+            st.session_state.pop(key, None)
 
 
 def active_employee() -> dict | None:
     employee = st.session_state.get("employee")
-    if not employee or time.time() - st.session_state.get("verified_at", 0) > 600:
+    if not employee:
+        return None
+    if (time.time() - st.session_state.get("verified_at", 0) > 600
+            or employee.get("site") != st.session_state.get("registration_site")):
         reset_registration()
         return None
     return employee
 
 
 st.title("Bahdela Hikvision Registration")
-st.caption("Enter your information, then register your face or fingerprint")
+st.caption("Select your site, then begin a new employee registration")
 
-required = (setting("HIKVISION_URL"), setting("HIKVISION_PASSWORD"), setting("ENROLLMENT_PIN"))
-if not all(required):
-    st.error("The administrator must configure the device URL, password and enrollment PIN in Streamlit secrets.")
+try:
+    secret_values = st.secrets.to_dict()
+except Exception:
+    secret_values = {}
+sites = load_sites(secret_values, os.environ)
+employee = active_employee()
+site_name = st.session_state.get("registration_site")
+if site_name not in sites:
+    reset_registration()
+    st.markdown('<h3><span class="step">1</span>Select site</h3>', unsafe_allow_html=True)
+    choice = st.selectbox("Registration site", list(sites), index=None, placeholder="Choose a site…", key="site_choice")
+    selected = sites.get(choice)
+    if selected and not selected.ready:
+        st.warning(f"{selected.name} needs a device password and enrollment PIN in Streamlit Secrets before registration can begin.")
+    if st.button("Begin new registration", type="primary", use_container_width=True,
+                 disabled=selected is None or not selected.ready):
+        reset_registration()
+        st.session_state.registration_site = selected.name
+        st.rerun()
+    st.info("Choose the site where the employee will use the Hikvision terminal.")
     st.stop()
 
-employee = active_employee()
+site = sites[site_name]
+st.info(f"Registration site: {site.name}. Employee details and biometrics will be saved to this site's terminal.")
+if st.button("Change site / start new registration", use_container_width=True, on_click=reset_registration):
+    st.rerun()
+if not site.ready:
+    st.error("This site's device password or enrollment PIN is missing. Ask the administrator to update Streamlit Secrets.")
+    st.stop()
 
 if employee is None:
-    st.markdown('<h3><span class="step">1</span>Enter employee information</h3>', unsafe_allow_html=True)
+    st.markdown('<h3><span class="step">2</span>Enter employee information</h3>', unsafe_allow_html=True)
     with st.form("employee_form"):
-        employee_no = st.text_input("Employee ID *", max_chars=32, placeholder="Example: 1001")
-        first_name = st.text_input("First name *", max_chars=40)
-        middle_name = st.text_input("Middle name", max_chars=40)
-        last_name = st.text_input("Last name *", max_chars=60)
-        gender = st.selectbox("Gender", ["unspecified", "male", "female"])
+        employee_no = st.text_input("Employee ID *", key="reg_employee_id", max_chars=32, placeholder="Example: 1001")
+        first_name = st.text_input("First name *", key="reg_first_name", max_chars=40)
+        middle_name = st.text_input("Middle name", key="reg_middle_name", max_chars=40)
+        last_name = st.text_input("Last name *", key="reg_last_name", max_chars=60)
+        gender = st.selectbox("Gender", ["unspecified", "male", "female"], key="reg_gender")
         d1, d2 = st.columns(2)
-        valid_from = d1.date_input("Effective from", value=date.today())
-        valid_until = d2.date_input("Effective until", value=date(2036, 12, 31))
-        access_plan = st.number_input("Access plan template", min_value=1, max_value=255, value=1)
-        pin = st.text_input("Enrollment PIN *", type="password")
-        confirm = st.checkbox("I confirm the information belongs to me and is correct.")
+        valid_from = d1.date_input("Effective from", value=date.today(), key="reg_from")
+        valid_until = d2.date_input("Effective until", value=date(2036, 12, 31), key="reg_until")
+        access_plan = st.number_input("Access plan template", min_value=1, max_value=255, value=1, key="reg_access_plan")
+        pin = st.text_input("Enrollment PIN *", key="reg_enrollment_pin", type="password")
+        confirm = st.checkbox("I confirm the information belongs to me and is correct.", key="reg_confirm")
         submitted = st.form_submit_button("Save and continue", type="primary", use_container_width=True)
 
     if submitted:
@@ -133,11 +148,12 @@ if employee is None:
             st.error("The end date cannot be earlier than the start date.")
         elif not confirm:
             st.error("Confirm that the information is yours and is correct.")
-        elif not safe_equal(pin, setting("ENROLLMENT_PIN")):
+        elif not safe_equal(pin, site.enrollment_pin):
             st.error("Incorrect enrollment PIN.")
         else:
             full_name = " ".join(filter(None, [first_name.strip(), middle_name.strip(), last_name.strip()]))
             record = {
+                "site": site.name,
                 "employee_no": employee_id,
                 "name": full_name,
                 "gender": gender,
@@ -146,7 +162,7 @@ if employee is None:
                 "access_plan": int(access_plan),
             }
             try:
-                client = api_client()
+                client = api_client(site)
                 with st.spinner("Saving employee information to the Hikvision device…"):
                     result, action = client.upsert_user(record)
                 if result.ok:
@@ -164,23 +180,28 @@ if employee is None:
 st.markdown(
     f"""
     <div class="profile"><strong>{escape(employee['employee_no'])} · {escape(employee['name'])}</strong>
-    <small>Valid until {escape(employee['valid_until'])}</small></div>
+    <small>Site: {escape(employee['site'])} · Valid until {escape(employee['valid_until'])}</small></div>
     """,
     unsafe_allow_html=True,
 )
 
-if st.button("Change employee information", use_container_width=True):
+def change_employee() -> None:
+    current_site = st.session_state.registration_site
     reset_registration()
+    st.session_state.registration_site = current_site
+
+
+if st.button("Change employee information", use_container_width=True, on_click=change_employee):
     st.rerun()
 
-client = api_client()
-st.markdown('<h3><span class="step">2</span>Add biometric information</h3>', unsafe_allow_html=True)
+client = api_client(site)
+st.markdown('<h3><span class="step">3</span>Add biometric information</h3>', unsafe_allow_html=True)
 face_tab, fingerprint_tab = st.tabs(["Face registration", "Fingerprint registration"])
 
 with face_tab:
     st.write("Use a clear, front-facing photograph with only one person visible.")
-    camera_photo = st.camera_input("Take face photograph")
-    uploaded_photo = st.file_uploader("Or upload a JPEG", type=["jpg", "jpeg"])
+    camera_photo = st.camera_input("Take face photograph", key="reg_camera")
+    uploaded_photo = st.file_uploader("Or upload a JPEG", type=["jpg", "jpeg"], key="reg_upload")
     photo = camera_photo or uploaded_photo
     if st.button("Save my face", type="primary", use_container_width=True, disabled=photo is None):
         try:
@@ -224,8 +245,7 @@ with fingerprint_tab:
 if st.session_state.get("face_done") or st.session_state.get("fingerprint_done"):
     st.divider()
     st.success("Registration is saved. You may add the other biometric method or finish.")
-    if st.button("Finish and clear this session", use_container_width=True):
-        reset_registration()
+    if st.button("Finish and clear this session", use_container_width=True, on_click=reset_registration):
         st.rerun()
 
 st.caption("The application does not permanently store face images or fingerprint templates. They are sent directly to the configured Hikvision terminal.")
